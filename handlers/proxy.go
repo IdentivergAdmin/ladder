@@ -133,10 +133,14 @@ func extractUrl(c *fiber.Ctx) (string, error) {
 	return urlQuery.String(), nil
 }
 
-// getFlareSolverrCookies retrieves cookies from FlareSolverr for the given URL
-func getFlareSolverrCookies(targetURL string) (string, error) {
+// getFlareSolverrResponse retrieves the fully rendered response from FlareSolverr.
+// Unlike the old cookie-only flow, callers can return the browser-rendered HTML
+// directly instead of issuing a second HTTP request that may be blocked.
+func getFlareSolverrResponse(targetURL string) (FlareSolverrResponse, error) {
+	var fsResp FlareSolverrResponse
+
 	if flareSolverrHost == "" {
-		return "", fmt.Errorf("FLARESOLVERR_HOST environment variable not set")
+		return fsResp, fmt.Errorf("FLARESOLVERR_HOST environment variable not set")
 	}
 
 	reqBody := FlareSolverrRequest{
@@ -147,31 +151,46 @@ func getFlareSolverrCookies(targetURL string) (string, error) {
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", err
+		return fsResp, err
 	}
 
-	resp, err := http.Post(flareSolverrHost+"/v1", "application/json", bytes.NewBuffer(jsonData))
+	client := &http.Client{
+		Timeout: 70 * time.Second,
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		flareSolverrHost+"/v1",
+		bytes.NewBuffer(jsonData),
+	)
 	if err != nil {
-		return "", err
+		return fsResp, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fsResp, err
 	}
 	defer resp.Body.Close()
 
-	var fsResp FlareSolverrResponse
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fsResp, fmt.Errorf("FlareSolverr HTTP error: %s", resp.Status)
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&fsResp); err != nil {
-		return "", err
+		return fsResp, err
 	}
 
 	if fsResp.Status != "ok" {
-		return "", fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
+		return fsResp, fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
 	}
 
-	// Build cookie string from the response
-	var cookies []string
-	for _, cookie := range fsResp.Solution.Cookies {
-		cookies = append(cookies, fmt.Sprintf("%s=%s", cookie.Name, cookie.Value))
+	if fsResp.Solution.Response == "" {
+		return fsResp, fmt.Errorf("FlareSolverr returned an empty response body")
 	}
 
-	return strings.Join(cookies, "; "), nil
+	return fsResp, nil
 }
 
 func ProxySite(rulesetPath string) fiber.Handler {
@@ -265,18 +284,19 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 		log.Println(u.String() + urlQuery)
 	}
 
-	// Modify the URI according to ruleset
+	// Modify the URI according to ruleset.
 	rule := fetchRule(u.Host, u.Path)
-	url, err := modifyURL(u.String()+urlQuery, rule)
+	targetURL, err := modifyURL(u.String()+urlQuery, rule)
 	if err != nil {
 		return "", nil, nil, err
 	}
 
-	// Fetch the site
-	client := &http.Client{
-		Timeout: time.Second * time.Duration(defaultTimeout),
+	// Build a request object for the normal direct-fetch path and for API/debug
+	// metadata when FlareSolverr is used.
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", nil, nil, err
 	}
-	req, _ := http.NewRequest("GET", url, nil)
 
 	if rule.Headers.UserAgent != "" {
 		req.Header.Set("User-Agent", rule.Headers.UserAgent)
@@ -300,27 +320,77 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 		req.Header.Set("Referer", u.String())
 	}
 
-	// Handle FlareSolverr integration
-	cookieValue := rule.Headers.Cookie
 	debug := os.Getenv("LOG_URLS") == "true"
 
+	// If the rule explicitly requests FlareSolverr, use the browser-rendered
+	// response directly. Do not replay the request with Go's http.Client.
 	if rule.UseFlareSolverr && flareSolverrHost != "" {
-		if fsCookies, err := getFlareSolverrCookies(url); err == nil {
-			if cookieValue != "" {
-				cookieValue = cookieValue + "; " + fsCookies
-			} else {
-				cookieValue = fsCookies
-			}
+		fsResp, fsErr := getFlareSolverrResponse(targetURL)
+		if fsErr == nil {
 			if debug {
-				log.Printf("Using FlareSolverr cookies for %s", url)
+				log.Printf(
+					"Using FlareSolverr rendered response for %s (status=%d, bytes=%d)",
+					targetURL,
+					fsResp.Solution.Status,
+					len(fsResp.Solution.Response),
+				)
 			}
-		} else if debug {
-			log.Printf("FlareSolverr error for %s: %v", url, err)
+
+			statusCode := fsResp.Solution.Status
+			if statusCode == 0 {
+				statusCode = http.StatusOK
+			}
+
+			resp := &http.Response{
+				StatusCode: statusCode,
+				Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+				Header:     make(http.Header),
+				Request:    req,
+			}
+
+			for key, value := range fsResp.Solution.Headers {
+				resp.Header.Set(key, value)
+			}
+
+			// FlareSolverr does not always include Content-Type in its response
+			// metadata even when Solution.Response contains HTML.
+			if resp.Header.Get("Content-Type") == "" {
+				resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+			}
+
+			if rule.Headers.CSP != "" {
+				resp.Header.Set("Content-Security-Policy", rule.Headers.CSP)
+			} else {
+				resp.Header.Del("Content-Security-Policy")
+			}
+
+			rewriteURL := u
+			if fsResp.Solution.URL != "" {
+				if parsedURL, parseErr := url.Parse(fsResp.Solution.URL); parseErr == nil && parsedURL.Host != "" {
+					rewriteURL = parsedURL
+				}
+			}
+
+			body := rewriteHtml([]byte(fsResp.Solution.Response), rewriteURL, rule)
+			return body, req, resp, nil
+		}
+
+		if debug {
+			log.Printf(
+				"FlareSolverr error for %s: %v; falling back to direct HTTP fetch",
+				targetURL,
+				fsErr,
+			)
 		}
 	}
 
-	if cookieValue != "" {
-		req.Header.Set("Cookie", cookieValue)
+	// Normal Ladder HTTP path, also used as a fallback if FlareSolverr fails.
+	if rule.Headers.Cookie != "" {
+		req.Header.Set("Cookie", rule.Headers.Cookie)
+	}
+
+	client := &http.Client{
+		Timeout: time.Second * time.Duration(defaultTimeout),
 	}
 
 	resp, err := client.Do(req)
@@ -335,13 +405,11 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 	}
 
 	if rule.Headers.CSP != "" {
-		// log.Println(rule.Headers.CSP)
 		resp.Header.Set("Content-Security-Policy", rule.Headers.CSP)
 	} else {
 		resp.Header.Del("Content-Security-Policy")
 	}
 
-	// log.Print("rule", rule) TODO: Add a debug mode to print the rule
 	body := rewriteHtml(bodyB, u, rule)
 	return body, req, resp, nil
 }
